@@ -117,7 +117,7 @@ class Attention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
 
         # Split head
-        qkv = qkv.view(batch_size, seq_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+        qkv = qkv.reshape(batch_size, seq_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
         query = qkv[:, :, :self.num_heads]
         key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
         value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
@@ -125,13 +125,15 @@ class Attention(nn.Module):
         # RoPE
         if cos_sin is not None:
             cos, sin = cos_sin
+            cos = cos.to(hidden_states.device)
+            sin = sin.to(hidden_states.device)
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         # flash attn
         query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
         attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
         attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        attn_output = attn_output.contiguous().reshape(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
 class LinearSwish(nn.Module):

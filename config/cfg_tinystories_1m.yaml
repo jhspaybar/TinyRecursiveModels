@@ -1,0 +1,32 @@
+defaults:
+  - arch: trm_tinystories_1m
+  - _self_
+
+hydra:
+  output_subdir: null
+
+dataset_name: tinystories
+data_path: data/hf/TinyStories
+tokenizer_name: gpt-neo-10k
+streaming: false
+
+seq_len: 512
+global_batch_size: 64
+max_sequences: 2100000  # Approximate full TinyStories train split
+
+eval_interval_sequences: 10000
+
+lr: 1.0e-2
+lr_min_ratio: 0.01
+lr_warmup_percent: 0.02
+weight_decay: 0.0
+beta1: 0.9
+beta2: 0.95
+grad_clip_norm: 1.0
+
+project_name: trm-tinystories
+wandb_mode: online
+wandb_base_url: http://localhost:8080
+
+seed: 42
+checkpoint_path: runs/checkpoints/trm_tinystories_1m

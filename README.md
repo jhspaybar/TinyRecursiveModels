@@ -20,16 +20,53 @@ Tiny Recursion Model (TRM) recursively improves its predicted answer y with a ti
 
 ### Requirements
 
-- Python 3.10 (or similar)
-- Cuda 12.6.0 (or similar)
+- Python 3.10+
+- Apple Silicon with Metal Performance Shaders (MPS) for the TinyStories text workflow
+
+We use [uv](https://github.com/astral-sh/uv) for dependency management. Sync the environment once:
 
 ```bash
-pip install --upgrade pip wheel setuptools
-pip install --pre --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126 # install torch based on your cuda version
-pip install -r requirements.txt # install requirements
-pip install --no-cache-dir --no-build-isolation adam-atan2 
-wandb login YOUR-LOGIN # login if you want the logger to sync results to your Weights & Biases (https://wandb.ai/)
+uv sync
 ```
+
+## TinyStories Text Training (Apple Silicon)
+
+The `pretrain_text.py` entrypoint adapts HRM-style training for TinyStories language modelling with a GPT-Neo tokenizer capped at 10K tokens. It runs on Apple Silicon/MPS and reports metrics to a local or offline W&B instance.
+
+### Dataset
+
+- Default cache location: `data/hf/TinyStories`
+- By default we stream from Hugging Face (`roneneldan/TinyStories`). For offline use, download the dataset with `datasets` and place the extracted files under the cache directory.
+
+### Quick smoke test
+
+```bash
+uv run python pretrain_text.py --config-name cfg_tinystories_1m \
+  max_sequences=64 \
+  global_batch_size=32 \
+  streaming=true \
+  wandb_mode=disabled
+```
+
+This consumes two TinyStories batches (~10 seconds on M2) and exits cleanly once `max_sequences` are processed.
+
+### Full TinyStories run (~1M parameters)
+
+```bash
+WANDB_MODE=offline \
+WANDB_PROJECT=trm-tinystories \
+uv run python pretrain_text.py --config-name cfg_tinystories_1m
+```
+
+The configuration expects a TinyStories snapshot under `data/hf/TinyStories` (e.g. populate it once with `datasets-cli download roneneldan/TinyStories`). Metrics log to the default W&B project `trm-tinystories` via a local server at `http://localhost:8080`. Checkpoints are written to `runs/checkpoints/trm_tinystories_1m/` by default.
+
+### Testing
+
+```bash
+uv run --group dev pytest
+```
+
+This covers the GPT-Neo tokenizer wrapper and validates the 1M parameter budget budget for the TinyStories architecture.
 
 ### Dataset Preparation
 

@@ -22,7 +22,8 @@ def log_stablemax(x, dim=-1):
 
 
 def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
-    logprobs = log_stablemax(logits.to(torch.float64), dim=-1)
+    logits = logits.to(torch.float32)
+    logprobs = log_stablemax(logits, dim=-1)
 
     if valid_mask is None:
         valid_mask = (labels != ignore_index)
@@ -32,10 +33,17 @@ def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask
     return -torch.where(valid_mask, prediction_logprobs, 0)
 
 
-def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
+def softmax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
     # Cast logits to f32
-    # Flatten logits
-    return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
+    losses = F.cross_entropy(
+        logits.to(torch.float32).view(-1, logits.shape[-1]),
+        labels.to(torch.long).view(-1),
+        ignore_index=ignore_index,
+        reduction="none",
+    ).view(labels.shape)
+    if valid_mask is not None:
+        losses = torch.where(valid_mask, losses, torch.zeros_like(losses))
+    return losses
 
 
 class ACTLossHead(nn.Module):
@@ -100,4 +108,3 @@ class ACTLossHead(nn.Module):
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
         return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
-

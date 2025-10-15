@@ -1,0 +1,16 @@
+# Python artifacts
+__pycache__/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+
+# Training outputs and datasets
+runs/
+data/hf/
+
+# Weights & Biases local logs
+wandb/
+
+# Hydra outputs
+outputs/
