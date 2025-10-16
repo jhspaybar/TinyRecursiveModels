@@ -1,7 +1,7 @@
 name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
 loss:
   name: losses@ACTLossHead
-  loss_type: stablemax_cross_entropy
+  loss_type: softmax_cross_entropy
 
 halt_exploration_prob: 0.05
 halt_max_steps: 4

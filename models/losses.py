@@ -8,17 +8,29 @@ import math
 IGNORE_LABEL_ID = -100
 
 
-def s(x, epsilon=1e-30):
+def s(x, epsilon=1e-6):
+    # Clamp x to prevent extreme values that cause numerical instability
+    x = torch.clamp(x, min=-10.0, max=10.0)
     return torch.where(
-        x<0,
-        1/(1-x+ epsilon),
-        x + 1
+        x < 0,
+        1 / (1 - x + epsilon),
+        x + 1 + epsilon
     )
 
 
-def log_stablemax(x, dim=-1):
-    s_x = s(x)
-    return torch.log(s_x/torch.sum(s_x, dim=dim, keepdim=True))
+def log_stablemax(x, dim=-1, epsilon=1e-6):
+    # Normalize logits by subtracting max (standard numerical stability trick)
+    x_max = torch.max(x, dim=dim, keepdim=True)[0]
+    x_normalized = x - x_max
+
+    # Apply transformation
+    s_x = s(x_normalized, epsilon=epsilon)
+
+    # Use log-sum-exp trick: log(a/sum(b)) = log(a) - log(sum(b))
+    log_sum_s_x = torch.log(torch.sum(s_x, dim=dim, keepdim=True) + epsilon)
+    log_s_x = torch.log(s_x + epsilon)
+
+    return log_s_x - log_sum_s_x
 
 
 def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
