@@ -1,0 +1,53 @@
+name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+loss:
+  name: losses@ACTLossHead
+  loss_type: softmax_cross_entropy
+
+halt_exploration_prob: 0.0
+halt_max_steps: 1
+
+# L6 variant with MoEUT sparsity compensation: 1*24*2 = 48 effective passes
+# (~4x more passes to compensate for ~33% active params per pass across a single gradient loop)
+H_cycles: 1
+L_cycles: 24
+
+H_layers: 0
+L_layers: 2
+
+# Match MoEUT_TinyStories_1M
+hidden_size: 64
+num_heads: 1
+
+expansion: 1  # Not used when use_moeut=True
+
+puzzle_emb_ndim: 0
+
+pos_encodings: rope
+forward_dtype: float32
+
+mlp_t: False
+puzzle_emb_len: 0
+no_ACT_continue: True
+tie_word_embeddings: True
+
+# MoEUT config matching MoEUT_TinyStories_1M
+use_moeut: True
+
+# FFN: 8 experts * 192 size, k=2 active (scaled up for ~426k params)
+moe_ff_n_experts: 8
+moe_ff_expert_size: 192
+moe_ff_k: 2
+
+# Attention: 2 experts, k=1 active
+moe_att_n_experts: 2
+moe_att_k: 1
+
+# Regularization
+moe_expert_dropout: 0.0
+moe_entropy_reg: 0.01
+moe_att_entropy_reg: 0.001
+moe_balance_coef: 0.0
+moe_bias_balancing: True
+moe_bias_update_rate: 0.05
+moe_bias_momentum: 0.9
+moe_bias_clip: 1.0

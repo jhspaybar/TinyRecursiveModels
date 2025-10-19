@@ -6,7 +6,7 @@ loss:
 halt_exploration_prob: 0.0
 halt_max_steps: 1
 
-H_cycles: 3
+H_cycles: 1
 L_cycles: 6
 
 H_layers: 0

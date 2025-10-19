@@ -20,6 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from utils.functions import get_model_source_path, load_model_class
 from text_datasets import TextDatasetConfig, create_dataset_loader
+from models.moeut_layers import SigmaMoE, SwitchHeadCore
 
 
 class LossConfig(pydantic.BaseModel):
@@ -89,6 +90,141 @@ class TrainState:
     total_steps: int
     sequences_consumed: int
     total_sequences: int
+
+
+def compute_moe_metrics(model: nn.Module) -> Dict[str, float]:
+    """Compute MoE diagnostic metrics similar to moeut reference implementation."""
+    ff_load, att_load = [], []
+    ff_entropy, att_entropy = [], []
+    ff_topk_max, att_topk_max = [], []
+    ff_sel_norms, att_sel_v_norms, att_sel_o_norms = [], [], []
+    ff_bias_abs, att_v_bias_abs, att_o_bias_abs = [], [], []
+    ff_route_scales, att_route_scales = [], []
+
+    def process_moe_stats(indices: torch.Tensor, scores: torch.Tensor, logits: torch.Tensor, n_experts: int):
+        """Process MoE layer statistics to compute load balance, entropy, and top-k max."""
+        try:
+            # Load balance: std deviation of expert usage
+            idx = indices.detach().to(torch.long)
+            counts = torch.bincount(idx.reshape(-1), minlength=n_experts).float()
+            total = counts.sum()
+            if total > 0:
+                load_std = float((counts / total).std(unbiased=False).cpu())
+            else:
+                load_std = 0.0
+
+            # Top-k max scores
+            max_scores = float(scores.detach().max(dim=-1).values.mean().cpu())
+
+            # Entropy of gating distribution
+            logits_flat = logits.detach().float()
+            probs = torch.sigmoid(logits_flat)
+            # Compute entropy: -sum(p * log(p) + (1-p) * log(1-p))
+            eps = 1e-10
+            probs_safe = torch.clamp(probs, eps, 1 - eps)
+            entropy = -(probs_safe * torch.log(probs_safe) + (1 - probs_safe) * torch.log(1 - probs_safe))
+            entropy_val = float(entropy.mean().cpu())
+
+            return load_std, max_scores, entropy_val
+        except Exception as e:
+            # Silently skip this module if there's an error
+            return None, None, None
+
+    # Collect stats from all MoE modules
+    for module in model.modules():
+        if isinstance(module, SigmaMoE):
+            if hasattr(module, 'last_topk_indices') and hasattr(module, 'last_topk_scores') and hasattr(module, 'last_selection_logits'):
+                load_std, max_scores, entropy_val = process_moe_stats(
+                    module.last_topk_indices,
+                    module.last_topk_scores,
+                    module.last_selection_logits,
+                    module.n_experts
+                )
+                if load_std is not None:
+                    ff_load.append(load_std)
+                    ff_topk_max.append(max_scores)
+                    ff_entropy.append(entropy_val)
+
+                    # Selector weight norm and bias magnitude (if available)
+                    with torch.no_grad():
+                        if hasattr(module, "expert_sel"):
+                            ff_sel_norms.append(float(module.expert_sel.norm().cpu()))
+                        if hasattr(module, "expert_bias"):
+                            ff_bias_abs.append(float(module.expert_bias.abs().mean().cpu()))
+                        if hasattr(module, "route_scale"):
+                            route_scale = module.route_scale.detach().cpu().float().mean().item()
+                            ff_route_scales.append(route_scale)
+
+        elif isinstance(module, SwitchHeadCore):
+            # For attention, we have both V and O experts
+            if hasattr(module, 'last_v_topk') and hasattr(module, 'last_v_scores') and hasattr(module, 'last_v_logits'):
+                # Combine V and O statistics for attention metrics
+                v_load_std, v_max_scores, v_entropy = process_moe_stats(
+                    module.last_v_topk,
+                    module.last_v_scores,
+                    module.last_v_logits,
+                    module.n_experts
+                )
+                o_load_std, o_max_scores, o_entropy = process_moe_stats(
+                    module.last_o_topk,
+                    module.last_o_scores,
+                    module.last_o_logits,
+                    module.n_experts
+                )
+                if v_load_std is not None and o_load_std is not None:
+                    # Average V and O stats
+                    att_load.append((v_load_std + o_load_std) / 2)
+                    att_topk_max.append((v_max_scores + o_max_scores) / 2)
+                    att_entropy.append((v_entropy + o_entropy) / 2)
+
+                with torch.no_grad():
+                    if hasattr(module, "sel_v"):
+                        att_sel_v_norms.append(float(module.sel_v.norm().cpu()))
+                    if hasattr(module, "sel_o"):
+                        att_sel_o_norms.append(float(module.sel_o.norm().cpu()))
+                    if hasattr(module, "expert_v_bias"):
+                        att_v_bias_abs.append(float(module.expert_v_bias.abs().mean().cpu()))
+                    if hasattr(module, "expert_o_bias"):
+                        att_o_bias_abs.append(float(module.expert_o_bias.abs().mean().cpu()))
+                    if hasattr(module, "route_scale"):
+                        route_scale = module.route_scale.detach().cpu().float().mean().item()
+                        att_route_scales.append(route_scale)
+
+    # Compute averages
+    metrics: Dict[str, float] = {}
+    if ff_load:
+        metrics["moe/ff_load_std"] = float(sum(ff_load) / len(ff_load))
+    if att_load:
+        metrics["moe/att_load_std"] = float(sum(att_load) / len(att_load))
+    if ff_entropy:
+        metrics["moe/ff_gate_entropy"] = float(sum(ff_entropy) / len(ff_entropy))
+    if att_entropy:
+        metrics["moe/att_gate_entropy"] = float(sum(att_entropy) / len(att_entropy))
+    if ff_topk_max:
+        metrics["moe/ff_topk_max"] = float(sum(ff_topk_max) / len(ff_topk_max))
+    if att_topk_max:
+        metrics["moe/att_topk_max"] = float(sum(att_topk_max) / len(att_topk_max))
+
+    if ff_sel_norms:
+        metrics["moe/ff_sel_norm"] = float(sum(ff_sel_norms) / len(ff_sel_norms))
+    if att_sel_v_norms:
+        metrics["moe/att_sel_v_norm"] = float(sum(att_sel_v_norms) / len(att_sel_v_norms))
+    if att_sel_o_norms:
+        metrics["moe/att_sel_o_norm"] = float(sum(att_sel_o_norms) / len(att_sel_o_norms))
+
+    if ff_bias_abs:
+        metrics["moe/ff_bias_abs_mean"] = float(sum(ff_bias_abs) / len(ff_bias_abs))
+    if att_v_bias_abs:
+        metrics["moe/att_v_bias_abs_mean"] = float(sum(att_v_bias_abs) / len(att_v_bias_abs))
+    if att_o_bias_abs:
+        metrics["moe/att_o_bias_abs_mean"] = float(sum(att_o_bias_abs) / len(att_o_bias_abs))
+
+    if ff_route_scales:
+        metrics["moe/ff_route_scale"] = float(sum(ff_route_scales) / len(ff_route_scales))
+    if att_route_scales:
+        metrics["moe/att_route_scale"] = float(sum(att_route_scales) / len(att_route_scales))
+
+    return metrics
 
 
 def _device() -> torch.device:
@@ -429,11 +565,31 @@ def train(config: PretrainConfig, device: torch.device, rank: int, world_size: i
         if config.grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(state.model.parameters(), config.grad_clip_norm)
 
+        # Update expert biases for loss-free balancing (DeepSeek approach)
+        # This is done after backward but before optimizer step, using no_grad
+        with torch.no_grad():
+            for module in state.model.modules():
+                if isinstance(module, (SigmaMoE, SwitchHeadCore)):
+                    if hasattr(module, 'update_expert_bias'):
+                        module.update_expert_bias()
+
         for optim in state.optimizers:
             optim.step()
             optim.zero_grad()
 
+        # Re-project selectors after optimiser updates so logits stay in range
+        with torch.no_grad():
+            for module in state.model.modules():
+                if isinstance(module, (SigmaMoE, SwitchHeadCore)):
+                    if getattr(module, "bias_balancing", False) and hasattr(module, "renorm_selectors"):
+                        module.renorm_selectors()
+
         extra_logs = {"train/lr": lr_this_step}
+
+        # Compute MoE diagnostic metrics if using MoEUT
+        with torch.no_grad():
+            moe_metrics = compute_moe_metrics(state.model)
+            extra_logs.update(moe_metrics)
 
         if metrics:
             with torch.no_grad():

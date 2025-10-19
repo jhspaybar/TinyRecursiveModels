@@ -10,6 +10,7 @@ import random
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
+from models.moeut_layers import SigmaMoE, SwitchHeadRope
 
 IGNORE_LABEL_ID = -100
 
@@ -50,7 +51,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
 
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
-    
+
     # Halting Q-learning config
     halt_max_steps: int
     halt_exploration_prob: float
@@ -64,6 +65,22 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     causal: bool = True # Causal masking for language modeling
     tie_word_embeddings: bool = True # Whether to tie input and output embeddings
 
+    # MoEUT config
+    use_moeut: bool = False # Use sparse MoEUT layers instead of dense layers
+    moe_ff_n_experts: int = 32 # Number of FFN experts
+    moe_ff_expert_size: int = 128 # Size of each FFN expert
+    moe_ff_k: int = 8 # Number of active FFN experts per token
+    moe_att_n_experts: int = 4 # Number of attention experts
+    moe_att_k: int = 2 # Number of active attention experts per head
+    moe_expert_dropout: float = 0.0 # Expert dropout probability
+    moe_entropy_reg: float = 0.01 # Entropy regularization coefficient for FFN
+    moe_att_entropy_reg: float = 0.001 # Entropy regularization coefficient for attention
+    moe_balance_coef: float = 0.0 # Load balancing coefficient (loss-based)
+    moe_bias_balancing: bool = False # Enable loss-free bias balancing (DeepSeek approach)
+    moe_bias_update_rate: float = 0.001 # Bias update rate for loss-free balancing
+    moe_bias_momentum: float = 0.9 # EMA factor for running load estimate
+    moe_bias_clip: float = 0.2 # Clamp for expert bias magnitude
+
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
@@ -76,17 +93,59 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 expansion=config.expansion,
             )
         else:
-            self.self_attn = Attention(
-                hidden_size=config.hidden_size,
-                head_dim=config.hidden_size // config.num_heads,
-                num_heads=config.num_heads,
-                num_key_value_heads=config.num_heads,
-                causal=config.causal
+            if self.config.use_moeut:
+                # Use sparse MoEUT attention
+                self.self_attn = SwitchHeadRope(
+                    state_size=config.hidden_size,
+                    n_heads=config.num_heads,
+                    n_experts=config.moe_att_n_experts,
+                    dropout=0.0,
+                    projection_size=config.hidden_size // config.num_heads,
+                    expert_dropout=config.moe_expert_dropout,
+                    moe_k=config.moe_att_k,
+                    rotate_fraction=0.5,
+                    rope_base=config.rope_theta,
+                    balance_coef=config.moe_balance_coef,
+                    bias_balancing=config.moe_bias_balancing,
+                    bias_update_rate=config.moe_bias_update_rate,
+                    bias_momentum=config.moe_bias_momentum,
+                    bias_clip=config.moe_bias_clip
+                )
+            else:
+                self.self_attn = Attention(
+                    hidden_size=config.hidden_size,
+                    head_dim=config.hidden_size // config.num_heads,
+                    num_heads=config.num_heads,
+                    num_key_value_heads=config.num_heads,
+                    causal=config.causal
+                )
+
+        if self.config.use_moeut:
+            # Use sparse MoEUT FFN
+            self.mlp = SigmaMoE(
+                dmodel=config.hidden_size,
+                n_experts=config.moe_ff_n_experts,
+                expert_size=config.moe_ff_expert_size,
+                k=config.moe_ff_k,
+                activation=F.relu,
+                expert_dropout=config.moe_expert_dropout,
+                balance_coef=config.moe_balance_coef,
+                bias_balancing=config.moe_bias_balancing,
+                bias_update_rate=config.moe_bias_update_rate,
+                bias_momentum=config.moe_bias_momentum,
+                bias_clip=config.moe_bias_clip
             )
-        self.mlp = SwiGLU(
-            hidden_size=config.hidden_size,
-            expansion=config.expansion,
-        )
+            # Initialize MoEUT layers using their reset_parameters method
+            # Using scale from MoEUT reference: sqrt(2 / (H_cycles * L_cycles * L_layers))
+            scale = math.sqrt(2 / (config.H_cycles * config.L_cycles * config.L_layers))
+            self.mlp.reset_parameters(scale)
+            if hasattr(self, 'self_attn') and isinstance(self.self_attn, SwitchHeadRope):
+                self.self_attn.reset_parameters(scale)
+        else:
+            self.mlp = SwiGLU(
+                hidden_size=config.hidden_size,
+                expansion=config.expansion,
+            )
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -99,9 +158,18 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             hidden_states = hidden_states.transpose(1,2)
         else:
             # Self Attention
-            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+            if self.config.use_moeut:
+                # MoEUT attention uses (q_src, k_src, v_src) signature
+                out = self.self_attn(hidden_states, hidden_states, hidden_states)
+            else:
+                out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         # Fully Connected
-        out = self.mlp(hidden_states)
+        if self.config.use_moeut:
+            # MoEUT FFN takes layer norm input for expert selection
+            out = self.mlp(hidden_states, rms_norm(hidden_states, variance_epsilon=self.norm_eps))
+        else:
+            out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         return hidden_states
 
@@ -199,7 +267,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -221,11 +289,27 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
 
+        # Collect MoEUT regularization losses
+        moe_reg_loss = torch.tensor(0.0, device=z_H.device, dtype=torch.float32)
+        if self.config.use_moeut:
+            from models.moeut_layers import SigmaMoE, SwitchHeadRope
+            for layer in self.modules():
+                if isinstance(layer, SigmaMoE):
+                    moe_reg_loss = moe_reg_loss + self.config.moe_entropy_reg * layer.get_reg_loss()
+                    if getattr(layer, "last_balance_loss", None) is not None:
+                        moe_reg_loss = moe_reg_loss + layer.last_balance_loss
+                        layer.last_balance_loss = None
+                elif isinstance(layer, SwitchHeadRope):
+                    moe_reg_loss = moe_reg_loss + self.config.moe_att_entropy_reg * layer.get_reg_loss()
+                    if getattr(layer, "last_balance_loss", None) is not None:
+                        moe_reg_loss = moe_reg_loss + layer.last_balance_loss
+                        layer.last_balance_loss = None
+
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), moe_reg_loss
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
@@ -269,12 +353,13 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), moe_reg_loss = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
+            "q_continue_logits": q_continue_logits,
+            "moe_reg_loss": moe_reg_loss
         }
 
         with torch.no_grad():
