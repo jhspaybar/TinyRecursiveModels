@@ -157,20 +157,24 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
             hidden_states = hidden_states.transpose(1,2)
         else:
-            # Self Attention
             if self.config.use_moeut:
-                # MoEUT attention uses (q_src, k_src, v_src) signature
-                out = self.self_attn(hidden_states, hidden_states, hidden_states)
+                # Peri-norm: normalize only the inputs used for routing and attention probes.
+                attn_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
+                out = self.self_attn(attn_norm, attn_norm, hidden_states)
+                hidden_states = hidden_states + out
             else:
+                # Self Attention (post-norm)
                 out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
-            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         # Fully Connected
         if self.config.use_moeut:
-            # MoEUT FFN takes layer norm input for expert selection
-            out = self.mlp(hidden_states, rms_norm(hidden_states, variance_epsilon=self.norm_eps))
+            # Peri-norm: provide normalized activations only to the selector while keeping residual raw.
+            ffn_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
+            out = self.mlp(hidden_states, ffn_norm)
+            hidden_states = hidden_states + out
         else:
             out = self.mlp(hidden_states)
-        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         return hidden_states
 
 class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
@@ -307,8 +311,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+        if self.config.use_moeut:
+            decode_states = rms_norm(z_H, variance_epsilon=self.config.rms_norm_eps)
+            output = self.lm_head(decode_states)[:, self.puzzle_emb_len:]
+            q_logits = self.q_head(decode_states[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+        else:
+            output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+            q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), moe_reg_loss
 
 

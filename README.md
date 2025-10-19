@@ -60,6 +60,16 @@ uv run python pretrain_text.py --config-name cfg_tinystories_1m
 
 The configuration expects a TinyStories snapshot under `data/hf/TinyStories` (e.g. populate it once with `datasets-cli download roneneldan/TinyStories`). Metrics log to the default W&B project `trm-tinystories` via a local server at `http://localhost:8080`. Checkpoints are written to `runs/checkpoints/trm_tinystories_1m/` by default.
 
+### Larger TinyStories run (~10M parameters)
+
+```bash
+WANDB_MODE=offline \
+WANDB_PROJECT=trm-tinystories \
+uv run python pretrain_text.py --config-name cfg_tinystories_10m_moeut
+```
+
+This variant keeps the width fixed at 64 but scales to 64 FF experts and 8 attention experts, landing just over 10 M parameters while preserving the TRM recurrence.
+
 ### Testing
 
 ```bash
