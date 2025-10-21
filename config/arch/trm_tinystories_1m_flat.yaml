@@ -1,0 +1,31 @@
+name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+loss:
+  name: losses@ACTLossHead
+  loss_type: softmax_cross_entropy
+
+halt_exploration_prob: 0.0
+halt_max_steps: 1
+
+H_cycles: 1
+L_cycles: 1
+
+H_layers: 0
+L_layers: 7
+
+hidden_size: 64
+num_heads: 1
+expansion: 4
+
+puzzle_emb_ndim: 0
+
+pos_encodings: rope
+forward_dtype: float32
+
+mlp_t: False
+puzzle_emb_len: 0
+no_ACT_continue: True
+tie_word_embeddings: True
+
+use_moeut: False
+
+flat_transformer: True

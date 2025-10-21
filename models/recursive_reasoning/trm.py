@@ -80,6 +80,8 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     moe_bias_update_rate: float = 0.001 # Bias update rate for loss-free balancing
     moe_bias_momentum: float = 0.9 # EMA factor for running load estimate
     moe_bias_clip: float = 0.2 # Clamp for expert bias magnitude
+    # Flat transformer config
+    flat_transformer: bool = False # Skip hierarchical cycles and run as standard transformer
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -162,6 +164,11 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 attn_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
                 out = self.self_attn(attn_norm, attn_norm, hidden_states)
                 hidden_states = hidden_states + out
+            elif self.config.flat_transformer:
+                # Flat dense transformer uses pre-norm attention.
+                attn_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
+                out = self.self_attn(cos_sin=cos_sin, hidden_states=attn_norm)
+                hidden_states = hidden_states + out
             else:
                 # Self Attention (post-norm)
                 out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
@@ -171,6 +178,10 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             # Peri-norm: provide normalized activations only to the selector while keeping residual raw.
             ffn_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
             out = self.mlp(hidden_states, ffn_norm)
+            hidden_states = hidden_states + out
+        elif self.config.flat_transformer:
+            mlp_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
+            out = self.mlp(mlp_norm)
             hidden_states = hidden_states + out
         else:
             out = self.mlp(hidden_states)
@@ -224,7 +235,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             pass
 
         # Reasoning Layers
-        self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+        if self.config.flat_transformer:
+            self.flat_layers = nn.ModuleList(
+                [TinyRecursiveReasoningModel_ACTV1Block(self.config) for _ in range(self.config.L_layers)]
+            )
+        else:
+            self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(
+                layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)]
+            )
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -280,18 +298,24 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
-        # H_cycles-1 without grad
-        with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
-                for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
-        # 1 with grad
-        for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
+        if self.config.flat_transformer:
+            hidden = input_embeddings
+            for layer in self.flat_layers:
+                hidden = layer(seq_info["cos_sin"], hidden)
+            z_L = hidden
+            z_H = hidden
+        else:
+            # H_cycles-1 without grad
+            with torch.no_grad():
+                for _H_step in range(self.config.H_cycles-1):
+                    for _L_step in range(self.config.L_cycles):
+                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                    z_H = self.L_level(z_H, z_L, **seq_info)
+            # 1 with grad
+            for _L_step in range(self.config.L_cycles):
+                z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+            z_H = self.L_level(z_H, z_L, **seq_info)
 
         # Collect MoEUT regularization losses
         moe_reg_loss = torch.tensor(0.0, device=z_H.device, dtype=torch.float32)
@@ -311,7 +335,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        if self.config.use_moeut:
+        if self.config.use_moeut or self.config.flat_transformer:
             decode_states = rms_norm(z_H, variance_epsilon=self.config.rms_norm_eps)
             output = self.lm_head(decode_states)[:, self.puzzle_emb_len:]
             q_logits = self.q_head(decode_states[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
