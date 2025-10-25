@@ -81,8 +81,22 @@ def _load_model(checkpoint_path: Path, device: torch.device):
     if loss_head_cls:
         model = loss_head_cls(model, loss_type=loss_type)
 
-    # Load weights
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    # Load weights with backward compatibility for old checkpoints
+    state_dict = checkpoint["model_state_dict"]
+
+    # Fix: Old flat transformer checkpoints have L_level.layers.X, new code expects flat_layers.X
+    if arch_config.get("flat_transformer", False):
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            # Rename L_level.layers.X -> flat_layers.X
+            if "L_level.layers." in key:
+                new_key = key.replace("L_level.layers.", "flat_layers.")
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        state_dict = new_state_dict
+
+    model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
 

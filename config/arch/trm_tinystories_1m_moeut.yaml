@@ -10,7 +10,7 @@ halt_max_steps: 1
 # Using L_cycles=4 (4x sparsity compensation for MoEUT)
 # H_cycles=1, L_cycles=4, L_layers=2 → 1*4*2 = 8 effective passes
 H_cycles: 1
-L_cycles: 1
+L_cycles: 7
 
 H_layers: 0
 L_layers: 2

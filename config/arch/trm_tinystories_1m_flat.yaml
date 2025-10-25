@@ -10,7 +10,7 @@ H_cycles: 1
 L_cycles: 1
 
 H_layers: 0
-L_layers: 7
+L_layers: 6
 
 hidden_size: 64
 num_heads: 1

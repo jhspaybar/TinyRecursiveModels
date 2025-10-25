@@ -149,6 +149,8 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 expansion=config.expansion,
             )
         self.norm_eps = config.rms_norm_eps
+        # Always use post-norm for MoEUT to prevent activation explosions
+        self._use_moeut_post_norm = self.config.use_moeut
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         # B, L, D = hidden_states.shape
@@ -160,10 +162,14 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             hidden_states = hidden_states.transpose(1,2)
         else:
             if self.config.use_moeut:
-                # Peri-norm: normalize only the inputs used for routing and attention probes.
+                # Normalize inputs for routing; optionally apply post-norm on the residual state when ACT loops > 1.
                 attn_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
-                out = self.self_attn(attn_norm, attn_norm, hidden_states)
-                hidden_states = hidden_states + out
+                residual = hidden_states
+                out = self.self_attn(attn_norm, attn_norm, residual)
+                if self._use_moeut_post_norm:
+                    hidden_states = rms_norm(residual + out, variance_epsilon=self.norm_eps)
+                else:
+                    hidden_states = residual + out
             elif self.config.flat_transformer:
                 # Flat dense transformer uses pre-norm attention.
                 attn_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
@@ -175,10 +181,14 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         # Fully Connected
         if self.config.use_moeut:
-            # Peri-norm: provide normalized activations only to the selector while keeping residual raw.
-            ffn_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
-            out = self.mlp(hidden_states, ffn_norm)
-            hidden_states = hidden_states + out
+            # Provide normalized activations to the selector; optionally apply post-norm on the residual state when ACT loops > 1.
+            ffn_residual = hidden_states
+            ffn_norm = rms_norm(ffn_residual, variance_epsilon=self.norm_eps)
+            out = self.mlp(ffn_residual, ffn_norm)
+            if self._use_moeut_post_norm:
+                hidden_states = rms_norm(ffn_residual + out, variance_epsilon=self.norm_eps)
+            else:
+                hidden_states = ffn_residual + out
         elif self.config.flat_transformer:
             mlp_norm = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
             out = self.mlp(mlp_norm)
